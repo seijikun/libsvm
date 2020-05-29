@@ -7,6 +7,9 @@
 #include <stdarg.h>
 #include <limits.h>
 #include <locale.h>
+#include <thread>
+#include <sstream>
+#include <vector>
 #include "svm.h"
 int libsvm_version = LIBSVM_VERSION;
 typedef float Qfloat;
@@ -3179,4 +3182,199 @@ void svm_set_print_string_function(void (*print_func)(const char *))
 		svm_print_string = &print_string_stdout;
 	else
 		svm_print_string = print_func;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+class SVMModelParserBufferSource {
+	std::istringstream buffer;
+
+public:
+	SVMModelParserBufferSource(const char* buffer, size_t len) : buffer(std::string(buffer, len)) {}
+
+	bool read_next(std::string& line) {
+		line.clear();
+		char c = 0;
+		while(buffer.read(&c, 1)) {
+			if(c != '\n' && c != ' ') { line.push_back(c); }
+			else { return line.size() > 0; }
+		}
+		return false;
+	}
+	bool read_line(std::string& line) {
+		return static_cast<bool>(std::getline(buffer, line));
+	}
+	template<typename TValue> bool get(TValue& value, char delim = '\n') {
+		if(buffer >> value) {
+			buffer.ignore(1, delim);
+			return true;
+		}
+		return false;
+	}
+	template<typename TValue> bool get_array(TValue* value, size_t len) {
+		for(size_t i = 0; i < len; ++i) {
+			if(!get(value[i], ' ')) { return false; }
+		}
+		return true;
+	}
+};
+
+#define exceptAssert(cond, err) if(!(cond)) { throw std::runtime_error(err); }
+template<typename TSource>
+class SVMModelParser {
+	svm_model* model = nullptr;
+	TSource model_source;
+
+public:
+	SVMModelParser(TSource&& model_source) : model_source(std::move(model_source)) {}
+
+	bool parse() {
+		model = Malloc(svm_model, 1);
+		memset(model, 0, sizeof(struct svm_model));
+		try {
+			parse_header();
+			parse_support_vectors();
+		} catch (std::runtime_error& e) {
+			fprintf(stderr, "ERROR: %s", e.what());
+			svm_free_and_destroy_model(&model);
+			return false;
+		}
+		return true;
+	}
+
+	struct svm_model* get_model() {
+		struct svm_model* model = this->model;
+		this->model = nullptr;
+		return model;
+	}
+
+private:
+	void parse_header() {
+		svm_parameter& param = model->param;
+		size_t nr_class_permutations = 0;
+
+		std::string buffer;
+		while(model_source.read_next(buffer) && buffer != "SV") {
+			if(buffer == "svm_type") {
+				exceptAssert(model_source.read_next(buffer), "Failed to read svm_type.");
+				param.svm_type = -1;
+				for(size_t i = 0; svm_type_table[i]; ++i) {
+					if(buffer == svm_type_table[i]) {
+						param.svm_type = i;
+						break;
+					}
+				}
+				exceptAssert(param.svm_type != -1, "Found unknown svm_type");
+			} else if(buffer == "kernel_type") {
+				param.kernel_type = -1;
+				exceptAssert(model_source.read_next(buffer), "Failed to read kernel_type.");
+				for(size_t i = 0; kernel_type_table[i]; ++i) {
+					if(buffer == kernel_type_table[i]) {
+						param.kernel_type = i;
+						break;
+					}
+				}
+				exceptAssert(param.kernel_type != -1, "Found unknown kernel_type");
+			} else if(buffer == "degree") {
+				exceptAssert(model_source.get(param.degree), "Failed to read degree.");
+			} else if(buffer == "gamma") {
+				exceptAssert(model_source.get(param.gamma), "Failed to read gamma.");
+			} else if(buffer == "coef0") {
+				exceptAssert(model_source.get(param.coef0), "Failed to read coef0.");
+			} else if(buffer == "nr_class") {
+				exceptAssert(model_source.get(model->nr_class), "Failed to read nr_class.");
+				nr_class_permutations = model->nr_class * (model->nr_class - 1) / 2;
+			} else if(buffer == "total_sv") {
+				exceptAssert(model_source.get(model->l), "Failed to read total_sv.");
+			} else if(buffer == "rho") {
+				model->rho = Malloc(double, nr_class_permutations);
+				exceptAssert(
+					model_source.get_array(model->rho, nr_class_permutations),
+					"Failed to read rho");
+			} else if(buffer == "label") {
+				model->label = Malloc(int, model->nr_class);
+				exceptAssert(
+					model_source.get_array(model->label, model->nr_class),
+					"Failed to read label");
+			} else if(buffer == "probA") {
+				model->probA = Malloc(double, nr_class_permutations);
+				exceptAssert(
+					model_source.get_array(model->probA, nr_class_permutations),
+					"Failed to read probA");
+			} else if(buffer == "probB") {
+				model->probB = Malloc(double, nr_class_permutations);
+				exceptAssert(
+					model_source.get_array(model->probB, nr_class_permutations),
+					"Failed to read probB");
+			} else if(buffer == "nr_sv") {
+				model->nSV = Malloc(int, model->nr_class);
+				exceptAssert(
+					model_source.get_array(model->nSV, model->nr_class),
+					"Failed to read nr_sv");
+			} else {
+				throw std::runtime_error("Unknown text in model file");
+			}
+		}
+	}
+	void parse_support_vectors() {
+		// prepare sv coefficient structure
+		model->sv_coef = Malloc(double *, model->nr_class - 1);
+		for(size_t i = 0; i < model->nr_class - 1; ++i) {
+			model->sv_coef[i] = Malloc(double, model->l);
+		}
+
+		std::string line_buffer;
+		svm_node node_buffer;
+		std::vector<svm_node> sv_buffer;
+		for(size_t i = 0; i < model->l; ++i) {
+			exceptAssert(model_source.read_line(line_buffer), "Failed to read SVs");
+			std::istringstream line(line_buffer);
+
+			// parse sv coefficients
+			for(size_t c = 0; c < model->nr_class - 1; ++c) {
+				exceptAssert(line >> model->sv_coef[c][i], "Failed to parse SV coefficient");
+			}
+
+			// parse SVs
+			while(line.good()) {
+				exceptAssert(line >> node_buffer.index && line.ignore(1,':') && line >> node_buffer.value, "Failed to read support vector");
+				sv_buffer.push_back(node_buffer);
+			}
+			sv_buffer.push_back({.index = -1, .value = 0.0});
+		}
+
+		// prepare sv structure
+		// support vectors will be stored within a single memory plane, that is indexed into
+		// by a pointer-array
+
+		// create memory plane that stores the support vectors
+		svm_node* support_vectors = Malloc(svm_node, sv_buffer.size());
+		memcpy(support_vectors, sv_buffer.data(), sizeof(svm_node) * sv_buffer.size());
+		// create and populate the pointer array, that points into the memory plane
+		model->SV = Malloc(svm_node*, model->l);
+		size_t s = 0;
+		for(size_t i = 0; i < sv_buffer.size(); ++i) {
+			model->SV[s++] = &support_vectors[i];
+			while(support_vectors[i].index != -1) { ++i; }
+		}
+
+		model->free_sv = 1; // XXX
+	}
+};
+
+svm_model* svm_parse_model_from_buffer(const char* model_buffer, unsigned int length) {
+	SVMModelParser<SVMModelParserBufferSource> parser({model_buffer, length});
+	if(!parser.parse()) { return nullptr; }
+	return parser.get_model();
 }
