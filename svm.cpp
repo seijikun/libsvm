@@ -3134,7 +3134,9 @@ private:
 				exceptAssert(line.ignore(1,':') && line >> node_buffer.value, "Failed to read support vector");
 				sv_buffer.push_back(node_buffer);
 			}
-			sv_buffer.push_back({.index = -1, .value = 0.0});
+			node_buffer.index = -1;
+			node_buffer.value = 0.0;
+			sv_buffer.push_back(node_buffer);
 		}
 
 		// prepare sv structure
